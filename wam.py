@@ -11,6 +11,7 @@ from fnmatch import fnmatch
 from urllib.request import urlretrieve
 from urllib.parse import urlparse
 
+import cerberus
 import setuptools.archive_util
 
 
@@ -47,13 +48,10 @@ class Download(object):
     Handles the download cache and offline mode.
     Download(options=None, cache=None, namespace=None,
              offline=False, fallback=False, hash_name=False, logger=None)
-    options: mapping of buildout options (e.g. a ``buildout`` config section)
-    cache: path to the download cache (excluding namespaces)
-    namespace: namespace directory to use inside the cache
+    download_cache: path to the download cache (excluding namespaces)
     offline: whether to operate in offline mode
     fallback: whether to use the cache as a fallback (try downloading first)
     hash_name: whether to use a hash of the URL as cache file name
-    logger: an optional logger to receive download-related log messages
     """
 
     def __init__(self, download_cache=None, offline=False, fallback=False, hash_name=False):
@@ -252,7 +250,7 @@ def calculate_base(extract_dir, strip):
 
 
 def extract_package(path, destination, *, strip, ignore_existing, excludes, verbose):
-    extract_dir = tempfile.mkdtemp(prefix='barrow-')
+    extract_dir = tempfile.mkdtemp(prefix='wam-')
     progress_filter = ProgressFilter(excludes, verbose=verbose)
     try:
         try:
@@ -322,9 +320,60 @@ def process_url(url, md5sum, destination, filename=None, mode=None, extract=None
             os.unlink(path)
 
 
+def _get_os_path(path):
+    if path is not None:
+        return os.path.expanduser(path)
+
+
+class Validator(cerberus.Validator):
+
+    def _normalize_coerce_path(self, value):
+        return os.path.expanduser(value)
+
+    def _validator_path_exists(self, field, value):
+        if not os.path.exists(value):
+            self._error(field, "Path %s does not exist." % value)
+
+    def _validator_source_version(self, field, value):
+        if '{version}' in self.document['source'] and not value:
+            self._error(field, "'source' have '{version}' marker, but 'version' parameter is not specified.")
+
+
+import colander
+
+
+class Asset(colander.MappingSchema):
+    source = colander.SchemaNode(colander.String())
+    target = colander.SchemaNode(colander.String(), missing='')
+    version = colander.SchemaNode(colander.String())
+    strip = colander.SchemaNode(colander.Bool(), missing=False)
+
+
+class Assets(colander.SequenceSchema):
+    asset = Asset()
+
+
+class Package(colander.MappingSchema):
+    cache = colander.SchemaNode(colander.String())
+    destination = colander.SchemaNode(colander.String())
+    assets = Assets()
+
+
+SCHEMA = {
+    'cache': {'type': 'string', 'coerce': 'path', 'default': os.path.join('~', '.wam', 'cache')},
+    'destination': {'type': 'string', 'empty': False, 'coerce': 'path', 'validator': ['path exists']},
+    'assets': {'type': 'list', 'empty': False, 'schema': {'type': 'dict', 'schema': {
+        'source': {'type': 'string', 'empty': False},
+        'target': {'type': 'string'},
+        'version': {'type': 'string', 'dependencies': ['source'], 'validator': ['source version']},
+        'strip': {'type': 'boolean', 'default': False},
+    }}}
+}
+
+
 def main():
     logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.DEBUG)
-    destination = '/tmp/barrow/static'
+    destination = '/tmp/wam/static'
 
     url = 'https://code.jquery.com/jquery-3.1.1.min.js'
     md5sum = None
@@ -336,25 +385,71 @@ def main():
     excludes = []
     verbose = False
     hash_name = False
-    destination = '/tmp/barrow/static'
-    download_cache = '/tmp/barrow/cache'
+    destination = '/tmp/wam/static'
+    download_cache = '/tmp/wam/cache'
 
     url = 'https://github.com/twbs/bootstrap/releases/download/v3.3.1/bootstrap-3.3.1-dist.zip'
     strip = True
-    destination = '/tmp/barrow/static/bootstrap'
+    destination = '/tmp/wam/static/bootstrap'
 
-    process_url(
-        url, md5sum, destination,
-        filename=filename,
-        mode=mode,
-        extract=extract,
-        download_cache=download_cache,
-        hash_name=hash_name,
-        strip=strip,
-        ignore_existing=ignore_existing,
-        excludes=excludes,
-        verbose=verbose,
-    )
+    assets = {
+        'cache': '/tmp/wam/cache',
+        'destination': '/tmp/wam/static',
+        'assets': [
+            {
+                'version': '3.1.1',
+                'source': 'https://code.jquery.com/jquery-{version}.min.js',
+                'target': 'jquery.min.js',
+            },
+            {
+                'version': '3.3.1',
+                'source': 'https://github.com/twbs/bootstrap/releases/download/v{version}/bootstrap-{version}-dist.zip',
+                'strip': True,
+                'target': 'bootstrap',
+            },
+            {
+                'version': '2.1.15',
+                'source': 'http://requirejs.org/docs/release/{version}/minified/require.js',
+                'target': 'require.min.js',
+            },
+            {
+                'version': '0.11.1',
+                'source': 'http://twitter.github.io/typeahead.js/releases/{version}/typeahead.bundle.min.js',
+            },
+        ]
+    }
+
+    # Check configuration file for errors
+    schema = Package()
+    try:
+        package = schema.deserialize(assets)
+    except colander.Invalid as e:
+        import json
+        print(json.dumps(e.asdict(), indent=2))
+        return
+
+    import json
+    print(json.dumps(package, indent=2))
+
+    # Try to download all assets and check checksums
+    download = Download(download_cache=download_cache, hash_name=hash_name)
+    for asset in package['assets']:
+        path, _ = download(asset['url'], md5sum=asset['md5sum'])
+
+    # Copy assets to the destination directory
+    for asset in package['assets']:
+        process_url(
+            url, md5sum, destination,
+            filename=filename,
+            mode=mode,
+            extract=extract,
+            download_cache=download_cache,
+            hash_name=hash_name,
+            strip=strip,
+            ignore_existing=ignore_existing,
+            excludes=excludes,
+            verbose=verbose,
+        )
 
 
 if __name__ == "__main__":
